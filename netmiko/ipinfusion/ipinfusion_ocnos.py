@@ -1,6 +1,6 @@
 import re
 import time
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional, Union
 from socket import socket
 
 from netmiko._telnetlib.telnetlib import (
@@ -51,7 +51,7 @@ class IpInfusionOcNOSBase(CiscoBaseConnection):
         config_command: str = "configure terminal",
         pattern: str = "",
         re_flags: int = 0,
-        force: bool = False,
+        force: Union[bool, str] = False,
     ) -> str:
         """
         Enter configuration mode.
@@ -63,11 +63,19 @@ class IpInfusionOcNOSBase(CiscoBaseConnection):
 
         That raises ConfigLockedException, which names the session holding the lock.
 
+        force="stale" force-unlocks only when the holder is confirmed to be a dead session of
+        our own: same username, same source IP as the device sees it, and a TCP connection
+        that has stopped acknowledging data. That is the usual aftermath of a dropped
+        connection: the device keeps the old session, and its lock, until TCP gives up on it.
+        A live session of the same user, e.g. a concurrent job, is never preempted this way.
+
         force=True releases the lock with 'cml force-unlock config-datastore running', then
         enters config mode, retrying briefly if the device is slow to let go. That preempts the
         other session and DISCARDS its uncommitted transaction. It forces at most once: if
         another session grabs the lock again, ConfigLockedException is raised.
         """
+        if force not in (False, True, "stale"):
+            raise ValueError(f"Invalid force={force!r}; use False, True or 'stale'")
         try:
             return super().config_mode(
                 config_command=config_command, pattern=pattern, re_flags=re_flags
@@ -78,7 +86,21 @@ class IpInfusionOcNOSBase(CiscoBaseConnection):
         if lock_holder is None:
             # Not a lock problem; report the original failure
             raise failure
-        if not force:
+        if force == "stale":
+            verdict = self._holder_is_own_dead_session(config_command, lock_holder)
+            if verdict == "entered":
+                # The lock went away while we probed, and the probe got us in
+                return ""
+            if verdict != "dead":
+                raise ConfigLockedException(
+                    f"Failed to enter configuration mode: the running datastore is locked by "
+                    f"another session ({lock_holder}), which is not confirmed to be a dead "
+                    f"session of ours, so it was left alone. Use config_mode(force=True) to "
+                    f"force-unlock it anyway.",
+                    output=str(failure),
+                    lock_holder=lock_holder,
+                ) from failure
+        elif not force:
             raise ConfigLockedException(
                 f"Failed to enter configuration mode: the running datastore is locked by "
                 f"another session ({lock_holder}). Use config_mode(force=True) to "
@@ -110,10 +132,124 @@ class IpInfusionOcNOSBase(CiscoBaseConnection):
         raise failure
 
     def _exec_command(self, command_string: str, **kwargs: Any) -> str:
-        """Run an exec-mode command from either mode; config mode needs a 'do' prefix."""
-        if self.check_config_mode():
-            command_string = f"do {command_string}"
-        return self._send_command_str(command_string, **kwargs)
+        """
+        Run an exec-mode command from either mode.
+
+        Config mode rejects exec commands without a 'do' prefix, so retry with one on
+        "Invalid input". Cheaper than check_config_mode() up front, which costs seconds.
+        """
+        output = self._send_command_str(command_string, **kwargs)
+        if "Invalid input" in output:
+            output = self._send_command_str(f"do {command_string}", **kwargs)
+        return output
+
+    def _sshd_connections(self) -> List[Dict[str, Any]]:
+        """Established SSH connections as the device sees them, with each one's send queue."""
+        conns: List[Dict[str, Any]] = []
+        # SSH normally runs in the management VRF; look in the default VRF only if it is not there
+        for cmd in ("show tcp ipv4 vrf management", "show tcp ipv4"):
+            if conns:
+                break
+            for line in self._exec_command(f"{cmd} | include sshd").splitlines():
+                match = re.search(
+                    r"^tcp6?\s+\d+\s+(\d+)\s+\S+:22\s+(\S+):(\d+)\s+ESTABLISHED\s+(\d+)/sshd:\s*(\S+)",
+                    line.strip(),
+                )
+                if match:
+                    conns.append(
+                        {
+                            "send_q": int(match.group(1)),
+                            "peer": (match.group(2), int(match.group(3))),
+                            "sshd_pid": int(match.group(4)),
+                            "user": match.group(5),
+                        }
+                    )
+        return conns
+
+    def _cli_session_pids(self) -> List[int]:
+        """PIDs of the CLI sessions (cmlsh) listed in 'show users'."""
+        pids = []
+        for line in self._exec_command("show users").splitlines():
+            match = re.search(r"\[\w\]\S+\s+\d+d\d+h\d+m\s+\S+\s+(\d+)\s", line)
+            if match:
+                pids.append(int(match.group(1)))
+        return pids
+
+    @staticmethod
+    def _cli_pid_for_sshd(
+        sshd_pid: int, sshd_pids: List[int], cli_pids: List[int]
+    ) -> Optional[int]:
+        """
+        The CLI session an SSH connection belongs to, or None if that cannot be told.
+
+        OcNOS shows no parent PIDs, but each login's sshd process is started just before its
+        cmlsh, so a connection's session is the first cmlsh PID after its sshd PID, provided
+        no other login's sshd started in between (interleaved logins are ambiguous).
+        """
+        later = [pid for pid in cli_pids if pid > sshd_pid]
+        if not later:
+            return None
+        cli_pid = min(later)
+        if any(sshd_pid < other < cli_pid for other in sshd_pids if other != sshd_pid):
+            return None
+        return cli_pid
+
+    def _holder_is_own_dead_session(self, config_command: str, lock_holder: str) -> str:
+        """
+        Is the lock holder our own user, from our IP, and no longer acknowledging?
+
+        Returns "dead" if so, "alive" if not (or if it cannot be confirmed), and "entered"
+        if the lock was released meanwhile and the probe itself got us into config mode.
+
+        Each refused 'configure terminal' makes OcNOS push "Another user attempted to acquire
+        lock" to the holder. A live holder acknowledges it within milliseconds; a dead one
+        (lost connection) never does, so its TCP send queue grows with every attempt. Knock
+        once more between two snapshots, then confirm that the one connection whose queue
+        grew belongs to the lock holder's CLI session. Anything uncertain counts as alive.
+        """
+        username = self.username or ""
+        # lock_holder carries the holder's 'show users' row, e.g. "... vty 1 [C]ocnos ..."
+        holder_user = re.search(r"\[\w\](\S+)", lock_holder)
+        if not username or not holder_user or holder_user.group(1) != username:
+            return "alive"
+
+        def mine(conn: Dict[str, Any]) -> bool:
+            # The process name is truncated in 'show tcp', so compare by prefix
+            return bool(conn["user"]) and username.startswith(conn["user"])
+
+        before = {c["peer"]: c["send_q"] for c in self._sshd_connections() if mine(c)}
+        knock = self._send_command_str(config_command, expect_string=r"#")  # second knock
+        if "locked by other client" not in knock:
+            if re.search(r"\(config[^)]*\)#", knock):
+                return "entered"  # the lock was released meanwhile
+            return "alive"
+        time.sleep(1 * self.global_delay_factor)
+        after = [c for c in self._sshd_connections() if mine(c)]
+        grown = [c for c in after if c["send_q"] > before.get(c["peer"], 0)]
+        if len(grown) != 1:
+            return "alive"
+        ghost = grown[0]
+        # The queue that grew must belong to the lock holder itself. A dead session that is
+        # not the holder (e.g. one preempted earlier) can also be written to at any moment.
+        holder_pid = re.search(r"\((\d+)\)", lock_holder)
+        all_sshd = [c["sshd_pid"] for c in self._sshd_connections()]
+        ghost_cli = self._cli_pid_for_sshd(ghost["sshd_pid"], all_sshd, self._cli_session_pids())
+        if not holder_pid or ghost_cli != int(holder_pid.group(1)):
+            return "alive"
+        # Same IP: every other live connection of this user (ours among them) shares the
+        # ghost's source IP. With sessions from more than one IP, 'ours' cannot be confirmed.
+        live_ips = {c["peer"][0] for c in after if c is not ghost}
+        return "dead" if live_ips == {ghost["peer"][0]} else "alive"
+
+    def _lock_client(self, datastore: str = "running") -> Optional[str]:
+        """The client holding a datastore lock, e.g. 'cmlsh(67219)', or None if unlocked."""
+        if datastore not in CONFIG_DATASTORES:
+            raise ValueError(f"Invalid datastore {datastore!r}; use one of {CONFIG_DATASTORES}")
+        output = self._exec_command("show cml config-datastore lock status")
+        match = re.search(
+            rf"{datastore} datastore is locked by client (\S+)", output, flags=re.IGNORECASE
+        )
+        return match.group(1) if match else None
 
     def get_config_lock_holder(self, datastore: str = "running") -> Optional[str]:
         """
@@ -126,15 +262,9 @@ class IpInfusionOcNOSBase(CiscoBaseConnection):
         When that PID is a CLI session, its row from 'show users' is appended (user, line,
         idle time, location).
         """
-        if datastore not in CONFIG_DATASTORES:
-            raise ValueError(f"Invalid datastore {datastore!r}; use one of {CONFIG_DATASTORES}")
-        output = self._exec_command("show cml config-datastore lock status")
-        match = re.search(
-            rf"{datastore} datastore is locked by client (\S+)", output, flags=re.IGNORECASE
-        )
-        if not match:
+        holder = self._lock_client(datastore)
+        if holder is None:
             return None
-        holder = match.group(1)
         pid = re.search(r"\((\d+)\)", holder)
         if pid:
             users = self._exec_command("show users")
@@ -161,11 +291,12 @@ class IpInfusionOcNOSBase(CiscoBaseConnection):
         )
         if "already unlocked" in output:
             return output
-        lock_holder = self.get_config_lock_holder(datastore=datastore)
-        if lock_holder is not None:
+        lock_client = self._lock_client(datastore=datastore)
+        if lock_client is not None:
             raise ValueError(
                 f"Failed to force-unlock the {datastore} datastore; it is still locked by "
-                f"{lock_holder}. Device response:\n\n{output}"
+                f"{self.get_config_lock_holder(datastore=datastore) or lock_client}. "
+                f"Device response:\n\n{output}"
             )
         return output
 

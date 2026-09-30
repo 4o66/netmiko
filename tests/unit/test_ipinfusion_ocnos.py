@@ -26,6 +26,7 @@ SHOW_USERS = """Current user          : (*).  Lock acquired by user : (#).
 CLI user              : [C].  Netconf users         : [N].
 
               Line        User          Idle         Location/Session  PID     TYPE   Role
+          129 vty 0    [C]ocnos       0d00h09m     pts/0             67109   Local  network-admin
 (#)       130 vty 1    [C]ocnos       0d00h04m     pts/1             67219   Local  network-admin
    (*)    131 vty 2    [C]ocnos       0d00h00m     pts/2             67240   Local  network-admin
 """
@@ -39,6 +40,13 @@ class FakeOcNOS(IpInfusionOcNOSBase):
         self.global_delay_factor = 0.0
         self.refuse_after_unlock = refuse_after_unlock
         self.relock_by_other = False
+        self.username = "ocnos"
+        self.holder_user = "ocnos"
+        self.holder_dead = True
+        self.holder_ip = "70.98.52.34"
+        self.old_dead_ghost = False
+        self.old_ghost_grows = False
+        self.knocks = 0
         self.global_cmd_verify = False
         self.RETURN = "\n"
         self.locked = locked
@@ -46,6 +54,27 @@ class FakeOcNOS(IpInfusionOcNOSBase):
         self.other_failure = other_failure
         self.in_config = False
         self.sent = []
+
+    def tcp_rows(self):
+        """(send_q, peer_ip, peer_port, sshd_pid, user) for each established SSH session."""
+        holder_q = 96 * (1 + self.knocks) if self.holder_dead else 0
+        rows = [
+            (holder_q, self.holder_ip, 41206, 67200, self.holder_user),
+            (0, "70.98.52.34", 35602, 67230, "ocnos"),  # our own session
+        ]
+        if self.old_dead_ghost:  # dead, but not the lock holder
+            # Normally gets no new data; old_ghost_grows models a stray write (e.g. an
+            # idle-logout warning) landing between the two snapshots
+            rows.append(
+                (
+                    96 + (self.knocks * 150 if self.old_ghost_grows else 0),
+                    "70.98.52.34",
+                    40000,
+                    67100,
+                    "ocnos",
+                )
+            )
+        return rows
 
     def check_config_mode(self, *args, **kwargs):
         return self.in_config
@@ -80,7 +109,25 @@ class FakeOcNOS(IpInfusionOcNOSBase):
         if command_string == "show cml config-datastore lock status":
             return STATUS_LOCKED if self.locked else STATUS_UNLOCKED
         if command_string == "show users":
-            return SHOW_USERS
+            return (
+                SHOW_USERS
+                if self.holder_user == "ocnos"
+                else SHOW_USERS.replace(
+                    "(#)       130 vty 1    [C]ocnos", "(#)       130 vty 1    [C]alice"
+                )
+            )
+        if command_string.startswith("show tcp ipv4"):
+            if "vrf management" not in command_string:
+                return ""
+            return "\n".join(
+                f"tcp        0 {q:>6} 10.70.1.171:22          {ip}:{port}     ESTABLISHED "
+                f"{pid}/sshd: {user} [ "
+                for (q, ip, port, pid, user) in self.tcp_rows()
+            )
+        if command_string == "configure terminal":
+            # Second knock: a dead holder never acks the lock notice, so its queue grows
+            self.knocks += 1
+            return LOCKED_REPLY
         if command_string.startswith("cml force-unlock config-datastore"):
             if not self.locked:
                 return f"{command_string}\n%% Running configuration store is already unlocked \n"
@@ -158,7 +205,9 @@ def test_get_config_lock_holder_from_config_mode():
     conn.config_mode()
     conn.locked = True
     assert conn.get_config_lock_holder().startswith("cmlsh(67219)")
+    # Tried plainly first, then with 'do' after "Invalid input"
     assert "do show cml config-datastore lock status" in conn.sent
+    assert "do show users" in conn.sent
 
 
 def test_config_mode_force_retries_brief_refusal_after_unlock():
@@ -182,3 +231,70 @@ def test_config_mode_force_reports_relock_by_another_session():
     with pytest.raises(ConfigLockedException, match="locked again"):
         conn.config_mode(force=True)
     assert sum("force-unlock" in c for c in conn.sent) == 1
+
+
+def test_force_stale_reclaims_own_dead_session():
+    conn = FakeOcNOS(locked=True)
+    conn.config_mode(force="stale")
+    assert conn.in_config
+    assert "cml force-unlock config-datastore running" in conn.sent
+
+
+@pytest.mark.parametrize(
+    "setup, why",
+    [
+        (lambda c: setattr(c, "holder_dead", False), "holder is alive (acks its notices)"),
+        (lambda c: setattr(c, "holder_user", "alice"), "holder is a different user"),
+        (lambda c: setattr(c, "holder_ip", "203.0.113.9"), "holder is from another IP"),
+    ],
+)
+def test_force_stale_leaves_other_sessions_alone(setup, why):
+    conn = FakeOcNOS(locked=True)
+    setup(conn)
+    with pytest.raises(ConfigLockedException, match="not confirmed"):
+        conn.config_mode(force="stale")
+    assert not any("force-unlock" in c for c in conn.sent), why
+
+
+def test_force_stale_not_fooled_by_an_old_ghost_that_is_not_the_holder():
+    """A dead non-holder already has a queue, but only the holder's grows on the knock."""
+    conn = FakeOcNOS(locked=True)
+    conn.old_dead_ghost = True
+    conn.config_mode(force="stale")
+    assert conn.in_config  # holder is dead and ours, the old ghost did not confuse it
+    conn2 = FakeOcNOS(locked=True)
+    conn2.old_dead_ghost = True
+    conn2.holder_dead = False
+    with pytest.raises(ConfigLockedException):
+        conn2.config_mode(force="stale")
+
+
+def test_force_invalid_value():
+    with pytest.raises(ValueError, match="Invalid force"):
+        FakeOcNOS(locked=True).config_mode(force="yes")
+    with pytest.raises(ValueError, match="Invalid force"):
+        FakeOcNOS().config_mode(force="yes")  # rejected even when nothing is locked
+
+
+def test_force_stale_not_fooled_when_a_non_holder_ghost_is_written_to():
+    """Found live: a preempted ghost's queue grew between snapshots; the holder was alive."""
+    conn = FakeOcNOS(locked=True)
+    conn.old_dead_ghost = True
+    conn.old_ghost_grows = True
+    conn.holder_dead = False
+    with pytest.raises(ConfigLockedException, match="not confirmed"):
+        conn.config_mode(force="stale")
+    assert not any("force-unlock" in c for c in conn.sent)
+
+
+@pytest.mark.parametrize(
+    "sshd, sshds, clis, expected",
+    [
+        (67200, [67200, 67230], [67219, 67240], 67219),  # normal
+        (67230, [67200, 67230], [67219, 67240], 67240),
+        (67200, [67200, 67210], [67219, 67240], None),  # another login interleaved
+        (67300, [67300], [67219, 67240], None),  # no session after it
+    ],
+)
+def test_cli_pid_for_sshd(sshd, sshds, clis, expected):
+    assert IpInfusionOcNOSBase._cli_pid_for_sshd(sshd, sshds, clis) == expected
