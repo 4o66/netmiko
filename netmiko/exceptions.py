@@ -1,3 +1,5 @@
+from typing import Optional
+
 from paramiko.ssh_exception import SSHException
 from paramiko.ssh_exception import AuthenticationException
 
@@ -36,6 +38,18 @@ class ConfigInvalidException(NetmikoBaseException):
     """Exception raised for invalid configuration error."""
 
     pass
+
+
+class ConfigLockedException(NetmikoBaseException, ValueError):
+    """Config mode refused because another session holds the configuration lock.
+
+    Also a ValueError, so code that catches the generic config_mode() failure keeps working.
+    """
+
+    def __init__(self, message: str, output: str = "", lock_holder: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.output = output
+        self.lock_holder = lock_holder
 
 
 class WriteException(NetmikoBaseException):

@@ -53,7 +53,7 @@ from netmiko.exceptions import (  # noqa
     NetmikoAuthenticationException,
     NetMikoAuthenticationException,
 )
-from netmiko.exceptions import ConfigInvalidException  # noqa
+from netmiko.exceptions import ConfigInvalidException, ConfigLockedException  # noqa
 from netmiko.exceptions import ReadException, ReadTimeout  # noqa
 from netmiko.exceptions import NetmikoBaseException, ConnectionException  # noqa
 from netmiko.ssh_autodetect import SSHDetect  # noqa
@@ -77,6 +77,7 @@ __all__ = (
     "NetmikoTimeoutException",
     "NetMikoTimeoutException",
     "ConfigInvalidException",
+    "ConfigLockedException",
     "ReadException",
     "ReadTimeout",
     "NetmikoAuthenticationException",

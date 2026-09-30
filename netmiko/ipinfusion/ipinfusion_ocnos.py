@@ -1,3 +1,4 @@
+import re
 import time
 from typing import Any, Optional
 from socket import socket
@@ -14,6 +15,9 @@ from netmiko._telnetlib.telnetlib import (
     Telnet,
 )
 from netmiko.cisco_base_connection import CiscoBaseConnection
+from netmiko.exceptions import ConfigLockedException
+
+CONFIG_DATASTORES = ("running", "candidate", "startup")
 
 
 class IpInfusionOcNOSBase(CiscoBaseConnection):
@@ -40,6 +44,129 @@ class IpInfusionOcNOSBase(CiscoBaseConnection):
         # Default 'exit_config_mode' to False unless it is explicitly overwritten
         exit_config_mode = kwargs.get("exit_config_mode", False)
         output = super().send_config_set(*args, **kwargs, exit_config_mode=exit_config_mode)
+        return output
+
+    def config_mode(
+        self,
+        config_command: str = "configure terminal",
+        pattern: str = "",
+        re_flags: int = 0,
+        force: bool = False,
+    ) -> str:
+        """
+        Enter configuration mode.
+
+        OcNOS locks the running datastore when 'configure terminal' is entered, so only one
+        session can be in config mode at a time. Another session trying to enter gets:
+
+        %% Running configuration store is locked by other client
+
+        That raises ConfigLockedException, which names the session holding the lock.
+
+        force=True releases the lock with 'cml force-unlock config-datastore running', then
+        enters config mode, retrying briefly if the device is slow to let go. That preempts the
+        other session and DISCARDS its uncommitted transaction. It forces at most once: if
+        another session grabs the lock again, ConfigLockedException is raised.
+        """
+        try:
+            return super().config_mode(
+                config_command=config_command, pattern=pattern, re_flags=re_flags
+            )
+        except ValueError as err:
+            failure = err
+        lock_holder = self.get_config_lock_holder()
+        if lock_holder is None:
+            # Not a lock problem; report the original failure
+            raise failure
+        if not force:
+            raise ConfigLockedException(
+                f"Failed to enter configuration mode: the running datastore is locked by "
+                f"another session ({lock_holder}). Use config_mode(force=True) to "
+                f"force-unlock it, which discards that session's uncommitted changes.",
+                output=str(failure),
+                lock_holder=lock_holder,
+            ) from failure
+        output = self.force_unlock_config()
+        # Rarely, 'configure terminal' is refused for a moment after the unlock even though
+        # the lock status already reads unlocked, so allow a few short retries. If another
+        # session has taken the lock in the meantime, report that rather than force again.
+        for attempt in range(1, 4):
+            try:
+                return output + super().config_mode(
+                    config_command=config_command, pattern=pattern, re_flags=re_flags
+                )
+            except ValueError as err:
+                failure = err
+            lock_holder = self.get_config_lock_holder()
+            if lock_holder is not None:
+                raise ConfigLockedException(
+                    f"Failed to enter configuration mode after force-unlock: the running "
+                    f"datastore was locked again by another session ({lock_holder}).",
+                    output=str(failure),
+                    lock_holder=lock_holder,
+                ) from failure
+            if attempt < 3:
+                time.sleep(1 * self.global_delay_factor)
+        raise failure
+
+    def _exec_command(self, command_string: str, **kwargs: Any) -> str:
+        """Run an exec-mode command from either mode; config mode needs a 'do' prefix."""
+        if self.check_config_mode():
+            command_string = f"do {command_string}"
+        return self._send_command_str(command_string, **kwargs)
+
+    def get_config_lock_holder(self, datastore: str = "running") -> Optional[str]:
+        """
+        Return who holds the lock on a configuration datastore, or None if it is unlocked.
+
+        'show cml config-datastore lock status' names the client and its PID:
+
+         Running datastore is locked by client cmlsh(67219)
+
+        When that PID is a CLI session, its row from 'show users' is appended (user, line,
+        idle time, location).
+        """
+        if datastore not in CONFIG_DATASTORES:
+            raise ValueError(f"Invalid datastore {datastore!r}; use one of {CONFIG_DATASTORES}")
+        output = self._exec_command("show cml config-datastore lock status")
+        match = re.search(
+            rf"{datastore} datastore is locked by client (\S+)", output, flags=re.IGNORECASE
+        )
+        if not match:
+            return None
+        holder = match.group(1)
+        pid = re.search(r"\((\d+)\)", holder)
+        if pid:
+            users = self._exec_command("show users")
+            for line in users.splitlines():
+                if re.search(rf"\s{pid.group(1)}\s", f" {line} "):
+                    holder += f" [{' '.join(line.split())}]"
+                    break
+        return holder
+
+    def force_unlock_config(self, datastore: str = "running") -> str:
+        """
+        Forcibly release the lock on a configuration datastore.
+
+        The session holding it is preempted and its uncommitted transaction is discarded.
+        Releasing a datastore that is already unlocked is not an error.
+        """
+        if datastore not in CONFIG_DATASTORES:
+            raise ValueError(f"Invalid datastore {datastore!r}; use one of {CONFIG_DATASTORES}")
+        # Success prints nothing; the only expected message is 'already unlocked'
+        output = self._exec_command(
+            f"cml force-unlock config-datastore {datastore}",
+            strip_prompt=False,
+            strip_command=False,
+        )
+        if "already unlocked" in output:
+            return output
+        lock_holder = self.get_config_lock_holder(datastore=datastore)
+        if lock_holder is not None:
+            raise ValueError(
+                f"Failed to force-unlock the {datastore} datastore; it is still locked by "
+                f"{lock_holder}. Device response:\n\n{output}"
+            )
         return output
 
     def commit(
